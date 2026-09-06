@@ -22,10 +22,6 @@ const COLOR_NAMES = [
     'brightBlack', 'brightRed', 'brightGreen', 'brightYellow', 'brightBlue', 'brightMagenta', 'brightCyan', 'brightWhite',
 ]
 
-// How many times to recreate the WebGL renderer after a lost GPU context
-// before giving up and letting xterm fall back to its DOM renderer.
-const MAX_WEBGL_RECOVERY_ATTEMPTS = 3
-
 class FlowControl {
     private blocked = false
     private blocked$ = new BehaviorSubject<boolean>(false)
@@ -87,8 +83,10 @@ export class XTermFrontend extends Frontend {
     private resizeObserver?: any
     private flowControl: FlowControl
     private pinnedToBottom = true
-    private pendingRendererRecovery = false
-    private rendererRecoveryAttempts = 0
+    private recoveryRetries = 0
+    private recoveryTimer: any = null
+    private isContextLost = false
+    private canvasMutationObserver?: MutationObserver
 
     private configService: ConfigService
     private hotkeysService: HotkeysService
@@ -212,7 +210,7 @@ export class XTermFrontend extends Frontend {
         //   - wheel/keyboard event listeners (below)
         //   - explicit scrollToBottom() calls
 
-        const doResize = () => {
+        this.resizeHandler = () => {
             try {
                 if (this.xterm.element && getComputedStyle(this.xterm.element).getPropertyValue('height') !== 'auto') {
                     const savedPinned = this.pinnedToBottom
@@ -229,47 +227,10 @@ export class XTermFrontend extends Frontend {
                         const targetY = Math.min(savedViewportY, maxScroll)
                         this.xterm.scrollToLine(targetY)
                     }
-
-                    // fitAddon.fit() resizes the renderer's drawing buffer,
-                    // which blanks it synchronously, but xterm only repaints on
-                    // the next animation frame — leaving one blank frame that
-                    // reads as flicker during a window drag. Force the repaint
-                    // now (after scrolling settles) to close that gap.
-                    this.xtermCore._renderService?._renderRows(0, this.xterm.rows - 1)
                 }
             } catch (e) {
                 // tends to throw when element wasn't shown yet
                 console.warn('Could not resize xterm', e)
-            }
-        }
-
-        // Rate-limit reflows during a window drag. The window 'resize' event and
-        // the ResizeObserver fire many times per frame; each reflow resizes the
-        // renderer's drawing buffer and re-uploads the glyph atlas texture. At
-        // full frame rate a fast drag issues reflows faster than the GPU can
-        // finish one, so frames composite with the text not yet repainted —
-        // visible as a flicker that only shows up when dragging quickly (slow
-        // drags leave enough time between reflows). Capping the reflow rate and
-        // always running a trailing fit keeps the final size correct without
-        // outrunning the renderer. Tune RESIZE_MIN_INTERVAL if needed.
-        const RESIZE_MIN_INTERVAL = 32
-        let resizePending = false
-        let lastResize = 0
-        const runResize = () => {
-            resizePending = false
-            lastResize = Date.now()
-            doResize()
-        }
-        this.resizeHandler = () => {
-            if (resizePending) {
-                return
-            }
-            resizePending = true
-            const wait = Math.max(0, RESIZE_MIN_INTERVAL - (Date.now() - lastResize))
-            if (wait > 0) {
-                setTimeout(() => requestAnimationFrame(runResize), wait)
-            } else {
-                requestAnimationFrame(runResize)
             }
         }
 
@@ -302,6 +263,8 @@ export class XTermFrontend extends Frontend {
         this.xterm.open(host)
         this.opened = true
 
+        this.setupContextLossListeners()
+
         // Work around font loading bugs
         await new Promise(resolve => setTimeout(resolve, this.hostApp.platform === Platform.Web ? 1000 : 0))
 
@@ -309,7 +272,14 @@ export class XTermFrontend extends Frontend {
         this.configureColors(profile.terminalColorScheme)
 
         if (this.enableWebGL) {
-            this.attachWebGLAddon()
+            this.webGLAddon = new WebglAddon()
+            if (typeof (this.webGLAddon as any).onContextLoss === 'function') {
+                (this.webGLAddon as any).onContextLoss(() => {
+                    console.warn('[Tabby] WebGL context loss from addon callback')
+                    this.triggerRecovery()
+                })
+            }
+            this.xterm.loadAddon(this.webGLAddon)
             this.platformService.displayMetricsChanged$.pipe(
                 takeUntil(this.destroyed$),
             ).subscribe(() => {
@@ -325,6 +295,10 @@ export class XTermFrontend extends Frontend {
             })
         }
 
+        fromEvent(window, 'focus').pipe(
+            takeUntil(this.destroyed$),
+        ).subscribe(() => this.checkAndRecover())
+
         // Allow an animation frame
         await new Promise(r => setTimeout(r, 100))
 
@@ -338,12 +312,6 @@ export class XTermFrontend extends Frontend {
         })
 
         window.addEventListener('resize', this.resizeHandler)
-
-        // The GPU context is often dropped while the app is in the background;
-        // retry recovery once the window is focused again and WebGL is usable.
-        fromEvent(window, 'focus').pipe(
-            takeUntil(this.destroyed$),
-        ).subscribe(() => this.recoverRenderer())
 
         this.resizeHandler()
 
@@ -398,7 +366,7 @@ export class XTermFrontend extends Frontend {
             event.stopPropagation()
         })
 
-        this.resizeObserver = new window['ResizeObserver'](() => this.resizeHandler())
+        this.resizeObserver = new window['ResizeObserver'](() => setTimeout(() => this.resizeHandler()))
         this.resizeObserver.observe(host)
     }
 
@@ -410,6 +378,12 @@ export class XTermFrontend extends Frontend {
 
     destroy (): void {
         super.destroy()
+        if (this.recoveryTimer) {
+            clearTimeout(this.recoveryTimer)
+            this.recoveryTimer = null
+        }
+        this.canvasMutationObserver?.disconnect()
+        this.canvasMutationObserver = undefined
         this.webGLAddon?.dispose()
         this.canvasAddon?.dispose()
         this.xterm.dispose()
@@ -473,24 +447,12 @@ export class XTermFrontend extends Frontend {
         this.xterm.clear()
     }
 
-    resetTerminalModes (): void {
-        // Disable mouse tracking modes (normal, button-event, any-event)
-        // and SGR extended mouse mode to prevent stale mouse tracking
-        // from leaking escape sequences as text after session reconnection
-        this.xterm.write('\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l')
-        // Disable bracketed paste mode
-        this.xterm.write('\x1b[?2004l')
-    }
-
     visualBell (): void {
         if (this.element) {
             this.element.style.animation = 'none'
-            // Force a synchronous reflow so the browser registers the cleared
-            // animation before it is reassigned. Without this, repeated bells
-            // arriving while a shake is still playing coalesce into a single
-            // frame and the animation fails to restart (#11303).
-            void this.element.offsetWidth
-            this.element.style.animation = 'terminalShakeFrames 0.3s ease'
+            setTimeout(() => {
+                this.element!.style.animation = 'terminalShakeFrames 0.3s ease'
+            })
         }
     }
 
@@ -668,76 +630,200 @@ export class XTermFrontend extends Frontend {
         this.resizeHandler()
     }
 
-    /**
-     * Redraw the terminal and recover the renderer when its tab is shown again.
-     * Reactivating clears stale renderer state left behind while the tab was
-     * hidden, and flushes any GPU context recovery deferred until now.
-     */
     reactivate (): void {
-        // An app- or window-level GPU reset can blank the canvas without firing
-        // xterm's per-canvas contextlost event, so pendingRendererRecovery stays
-        // unset. Treat a WebGL frontend that has lost its addon as needing
-        // recovery too, so a shown-but-blank pane always gets its context back
-        // instead of relying on a manual window resize.
-        if (this.pendingRendererRecovery || this.enableWebGL && !this.webGLAddon) {
-            this.pendingRendererRecovery = true
-            this.recoverRenderer()
+        if (this.isContextLost || this.isContextLostNow() || this.enableWebGL && !this.webGLAddon) {
+            console.log('[Tabby] reactivate: Context loss detected, triggering checkAndRecover')
+            this.isContextLost = true
+            this.checkAndRecover()
         } else {
-            // The pane is shown with a live renderer, so any earlier transient
-            // losses shouldn't count against a future recovery — reset the budget
-            // to avoid permanently downgrading the pane to the DOM renderer.
-            this.rendererRecoveryAttempts = 0
             this.redraw()
         }
     }
 
-    private attachWebGLAddon (): void {
-        const addon = new WebglAddon()
-        // xterm fires this when the GPU drops the canvas context (driver reset,
-        // backgrounded app, too many live contexts).
-        addon.onContextLoss(() => this.onWebGLContextLoss())
-        this.xterm.loadAddon(addon)
-        this.webGLAddon = addon
-    }
-
-    private onWebGLContextLoss (): void {
-        this.webGLAddon?.dispose()
-        this.webGLAddon = undefined
-        this.pendingRendererRecovery = true
-        this.recoverRenderer()
-    }
-
-    /**
-     * Recreate the WebGL renderer after a lost GPU context. A new context can
-     * only be created on a visible, focused canvas, so this no-ops while the
-     * tab is hidden and is retried on reactivation or window focus.
-     */
-    private recoverRenderer (): void {
-        if (!this.pendingRendererRecovery || !this.canRecoverRenderer()) {
-            return
-        }
-        this.pendingRendererRecovery = false
-        if (this.rendererRecoveryAttempts < MAX_WEBGL_RECOVERY_ATTEMPTS) {
-            this.rendererRecoveryAttempts++
-            this.attachWebGLAddon()
-        }
-        // Once the retry budget is exhausted xterm falls back to its DOM renderer.
-        this.redraw()
-    }
-
-    private canRecoverRenderer (): boolean {
-        return !!this.element && this.element.offsetParent !== null && document.hasFocus()
-    }
-
-    private redraw (): void {
+    redraw (): void {
         const renderService = this.xtermCore._renderService
         renderService?.clear()
-        // handleResize() alone is a no-op when cols/rows are unchanged
-        // resizeHandler() runs a real itAddon.fit() followed
-        // by an unconditional viewport._refresh(),
-        // forcing a full repaint
         this.resizeHandler()
         renderService?.handleResize(this.xterm.cols, this.xterm.rows)
+    }
+
+    private recreateRenderer (): void {
+        if (this.recoveryTimer) {
+            clearTimeout(this.recoveryTimer)
+            this.recoveryTimer = null
+        }
+
+        if (!this.element?.offsetParent) {
+            console.log('[Tabby] recreateRenderer deferred: tab is hidden')
+            this.isContextLost = true
+            return
+        }
+
+        try {
+            console.log(`[Tabby] recreateRenderer: Rebuilding WebGL addon (attempt ${this.recoveryRetries})...`)
+            if (this.webGLAddon) {
+                try { this.webGLAddon.dispose() } catch (e) {}
+                this.webGLAddon = undefined
+            }
+            if (this.canvasAddon) {
+                try { this.canvasAddon.dispose() } catch (e) {}
+                this.canvasAddon = undefined
+            }
+
+            if (this.enableWebGL) {
+                this.webGLAddon = new WebglAddon()
+                if (typeof (this.webGLAddon as any).onContextLoss === 'function') {
+                    (this.webGLAddon as any).onContextLoss(() => {
+                        console.warn('[Tabby] WebGL context loss from addon callback')
+                        this.triggerRecovery()
+                    })
+                }
+                this.xterm.loadAddon(this.webGLAddon)
+                console.log('[Tabby] Successfully loaded WebglAddon into xterm')
+            }
+
+            this.setupContextLossListeners()
+            this.redraw()
+        } catch (err) {
+            console.error('[Tabby] Error in recreateRenderer:', err)
+        }
+
+        // Post-recovery validation: if GPU driver is still resetting, schedule next retry
+        setTimeout(() => {
+            if (!this.element?.offsetParent) {
+                return
+            }
+            if (this.isContextLostNow()) {
+                console.warn('[Tabby] GPU context still unavailable. Driver still recovering...')
+                this.triggerRecovery()
+            } else {
+                console.log('[Tabby] WebGL context verified alive! Resetting retry count.')
+                this.recoveryRetries = 0
+                this.isContextLost = false
+            }
+        }, 600)
+    }
+
+    recoverRenderer (): void {
+        this.checkAndRecover()
+    }
+
+    private triggerRecovery (): void {
+        this.isContextLost = true
+
+        if (!this.element?.offsetParent) {
+            console.log('[Tabby] triggerRecovery deferred: tab is hidden, will recover on reactivate')
+            return
+        }
+
+        if (this.recoveryTimer) {
+            return
+        }
+
+        this.recoveryRetries++
+        if (this.recoveryRetries > 10) {
+            console.warn('[Tabby] WebGL recovery retry limit reached (10 retries / ~30s). Falling back to DOM renderer.')
+            this.enableWebGL = false
+            try {
+                if (this.webGLAddon) {
+                    this.webGLAddon.dispose()
+                    this.webGLAddon = undefined
+                }
+            } catch (e) {}
+            this.redraw()
+            return
+        }
+
+        const delay = Math.min(3000, 400 * Math.pow(1.6, this.recoveryRetries - 1))
+        console.warn(`[Tabby] Scheduling WebGL recovery attempt #${this.recoveryRetries} in ${Math.round(delay)}ms...`)
+        this.recoveryTimer = setTimeout(() => {
+            this.recoveryTimer = null
+            this.recreateRenderer()
+        }, delay)
+    }
+
+    private setupContextLossListeners (): void {
+        setTimeout(() => {
+            const host = this.element
+            if (!host) {
+                return
+            }
+
+            const bindCanvas = (canvas: HTMLCanvasElement) => {
+                if (!(canvas as any)._contextLossListenerBound) {
+                    const handler = (e: Event) => {
+                        e.preventDefault()
+                        console.warn('[Tabby] WebGL context lost event fired on canvas!')
+                        this.triggerRecovery()
+                    }
+                    canvas.addEventListener('webglcontextlost', handler, false)
+                    canvas.addEventListener('contextlost', handler, false)
+                    ;(canvas as any)._contextLossListenerBound = true
+                }
+            }
+
+            if (!this.canvasMutationObserver) {
+                this.canvasMutationObserver = new MutationObserver(() => {
+                    const canvases = host.querySelectorAll('canvas')
+                    canvases.forEach(bindCanvas)
+                })
+                this.canvasMutationObserver.observe(host, { childList: true, subtree: true })
+            }
+
+            const canvases = host.querySelectorAll('canvas')
+            canvases.forEach(bindCanvas)
+        }, 200)
+    }
+
+    isContextLostNow (): boolean {
+        if (!this.element) {
+            return false
+        }
+        if (this.enableWebGL) {
+            if (!this.webGLAddon) {
+                return true
+            }
+            try {
+                const gl = (this.webGLAddon as any)._renderer?._gl ?? this.xtermCore?._renderService?._renderer?._gl
+                if (gl && (gl as WebGLRenderingContext).isContextLost()) {
+                    return true
+                }
+            } catch (e) {
+                return true
+            }
+            const canvases = this.element.querySelectorAll('canvas')
+            if (canvases.length === 0) {
+                return true
+            }
+            for (const canvas of Array.from(canvases)) {
+                try {
+                    const gl = canvas.getContext('webgl2') ?? canvas.getContext('webgl')
+                    if (gl && (gl as WebGLRenderingContext).isContextLost()) {
+                        return true
+                    }
+                } catch (e) {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    checkAndRecover (): void {
+        if (this.isContextLostNow()) {
+            this.isContextLost = true
+        }
+
+        if (this.isContextLost) {
+            if (this.element?.offsetParent) {
+                console.log('[Tabby] checkAndRecover: Tab is visible, triggering recovery.')
+                this.triggerRecovery()
+            } else {
+                console.log('[Tabby] checkAndRecover: Tab is hidden, deferring recovery.')
+            }
+        } else {
+            this.redraw()
+        }
     }
 
     private getSelectionAsHTML (): string {
